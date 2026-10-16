@@ -19,6 +19,7 @@ The script uses PowerShell's native `Write-Progress` renderer for separate overa
 - **Artwork and attachments:** attached-picture streams are copied where possible; Matroska attachments are preserved for `.mkv` and `.mka` files.
 - **Optional recursive mode:** process subfolders while preserving their folder structure under `output`.
 - **Safer output handling:** FFmpeg writes to a temporary file first. The final output is replaced only after FFmpeg completes successfully.
+- **Reliable cancellation:** press `Q`, `Esc`, or `Ctrl+C` during conversion to stop the active FFmpeg process and cancel the remaining queue. FFmpeg is placed in a Windows Job Object configured to terminate its processes when the PowerShell process closes, so closing the terminal window also stops the conversion.
 - **Logs:** creates `Logs` automatically and saves a timestamped run log, including FFmpeg warnings and errors.
 - **Skip existing outputs:** optional Advanced Setting for avoiding re-encoding files that already have an output.
 - **No unnecessary setup questions:** the normal workflow asks only for speed and file selection. Extra options are available through **Advanced Settings** (`A`) at either main prompt.
@@ -118,6 +119,18 @@ The console shows two linked native PowerShell progress indicators:
 The progress UI is rendered by PowerShell instead of manually positioning console cursor rows. This avoids the missing overall bar and stale/empty per-file bars that can occur when direct console writes are mixed with PowerShell output. FFmpeg progress records are consumed internally; diagnostic warnings and errors go to the log instead of repeatedly flooding the screen.
 
 A timestamped log is written to `Logs/` for each run. FFmpeg diagnostic output is saved there instead of flooding the console with repeated `frame=...` status lines. Keep the log when reporting a failed conversion.
+
+## Cancelling a conversion
+
+You can cancel the current conversion at any time while FFmpeg is running:
+
+- Press **`Q`** or **`Esc`** in the console to stop the current file and stop the remaining queue.
+- Press **`Ctrl+C`** to request cancellation. The script attempts to stop FFmpeg and report the cancellation in the summary. If the host interrupts the PowerShell pipeline before the summary can be printed, the active FFmpeg process is still covered by the automatic process cleanup mechanism.
+- Close the PowerShell window or Windows Terminal tab to terminate the running script. FFmpeg is assigned to a Windows Job Object using `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`; Windows terminates the child process when the script's job handle is closed.
+
+The script does not start a conversion unless it can create the cleanup Job Object, and it stops a newly started FFmpeg process if assigning it to the Job Object fails. This fail-safe behavior is intentional: it avoids knowingly running a conversion that could be left behind.
+
+On a normal cancellation, the incomplete temporary output is removed and the existing final output is left untouched. If the terminal is forcibly closed, Windows stops FFmpeg, but PowerShell may not get a chance to remove its temporary file. Such files have names containing `.speedtmp_` inside `output/`; they are incomplete and can be deleted manually.
 
 ## Supported inputs and caveats
 
