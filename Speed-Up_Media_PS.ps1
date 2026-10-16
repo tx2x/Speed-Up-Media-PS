@@ -5,6 +5,8 @@
 .DESCRIPTION
     By default, asks only for speed (2x) and file selection (all files).
     Press A at either main prompt to open Advanced Settings. Results are saved to output\ and logs are written to Logs\.
+    During conversion, press Q, Esc, or Ctrl+C to cancel. FFmpeg is placed in a kill-on-close Windows Job Object
+    to prevent background conversions from surviving the PowerShell process.
     Windows PowerShell 5.1 or later is required.
 #>
 
@@ -20,6 +22,11 @@ $script:RootDirectory = if (-not [string]::IsNullOrWhiteSpace($PSScriptRoot)) {
 $script:OutputDirectory = Join-Path $script:RootDirectory 'output'
 $script:LogsDirectory = Join-Path $script:RootDirectory 'Logs'
 $script:LogPath = $null
+$script:ProcessJobHandle = [IntPtr]::Zero
+$script:ActiveFfmpegProcess = $null
+$script:CancellationRequested = $false
+$script:CancelHandler = $null
+$script:CancelHandlerRegistered = $false
 
 $script:Settings = [ordered]@{
     Quality             = 'Balanced'
@@ -513,6 +520,193 @@ function Quote-ProcessArgument {
     return $builder.ToString()
 }
 
+function Initialize-ProcessJob {
+    if ($script:ProcessJobHandle -ne [IntPtr]::Zero) { return }
+
+    if (-not ('SpeedUpMediaNative.JobApi' -as [type])) {
+        $nativeSource = @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace SpeedUpMediaNative
+{
+    public static class JobApi
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct BasicLimitInformation
+        {
+            public long PerProcessUserTimeLimit;
+            public long PerJobUserTimeLimit;
+            public uint LimitFlags;
+            public UIntPtr MinimumWorkingSetSize;
+            public UIntPtr MaximumWorkingSetSize;
+            public uint ActiveProcessLimit;
+            public UIntPtr Affinity;
+            public uint PriorityClass;
+            public uint SchedulingClass;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct IoCounters
+        {
+            public ulong ReadOperationCount;
+            public ulong WriteOperationCount;
+            public ulong OtherOperationCount;
+            public ulong ReadTransferCount;
+            public ulong WriteTransferCount;
+            public ulong OtherTransferCount;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct ExtendedLimitInformation
+        {
+            public BasicLimitInformation BasicLimitInformation;
+            public IoCounters IoInfo;
+            public UIntPtr ProcessMemoryLimit;
+            public UIntPtr JobMemoryLimit;
+            public UIntPtr PeakProcessMemoryUsed;
+            public UIntPtr PeakJobMemoryUsed;
+        }
+
+        private static int _lastError;
+        public static int LastError { get { return _lastError; } }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr CreateJobObject(IntPtr jobAttributes, string name);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetInformationJobObject(IntPtr job, int informationClass, IntPtr information, uint informationLength);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        public static IntPtr CreateKillOnCloseJob()
+        {
+            _lastError = 0;
+            IntPtr job = CreateJobObject(IntPtr.Zero, null);
+            if (job == IntPtr.Zero)
+            {
+                _lastError = Marshal.GetLastWin32Error();
+                return IntPtr.Zero;
+            }
+
+            ExtendedLimitInformation information = new ExtendedLimitInformation();
+            // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            information.BasicLimitInformation.LimitFlags = 0x2000;
+            int length = Marshal.SizeOf(typeof(ExtendedLimitInformation));
+            IntPtr buffer = Marshal.AllocHGlobal(length);
+            try
+            {
+                Marshal.StructureToPtr(information, buffer, false);
+                if (!SetInformationJobObject(job, 9, buffer, (uint)length))
+                {
+                    _lastError = Marshal.GetLastWin32Error();
+                    CloseHandle(job);
+                    return IntPtr.Zero;
+                }
+                return job;
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buffer);
+            }
+        }
+
+        public static bool Assign(IntPtr job, IntPtr process)
+        {
+            bool success = AssignProcessToJobObject(job, process);
+            if (!success) _lastError = Marshal.GetLastWin32Error();
+            return success;
+        }
+
+        public static void Close(IntPtr handle)
+        {
+            if (handle != IntPtr.Zero) CloseHandle(handle);
+        }
+    }
+}
+'@
+        Add-Type -TypeDefinition $nativeSource -Language CSharp -ErrorAction Stop
+    }
+
+    $jobHandle = [SpeedUpMediaNative.JobApi]::CreateKillOnCloseJob()
+    if ($jobHandle -eq [IntPtr]::Zero) {
+        $nativeError = [SpeedUpMediaNative.JobApi]::LastError
+        throw ("Could not create a Windows Job Object for FFmpeg cleanup (Win32 error {0}). Conversion was not started because it would not be safe to leave a background process behind." -f $nativeError)
+    }
+    $script:ProcessJobHandle = $jobHandle
+}
+
+function Add-ProcessToCleanupJob {
+    param([Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process)
+
+    if ($script:ProcessJobHandle -eq [IntPtr]::Zero) {
+        throw 'The FFmpeg cleanup Job Object is not initialized.'
+    }
+
+    if (-not [SpeedUpMediaNative.JobApi]::Assign($script:ProcessJobHandle, $Process.Handle)) {
+        $nativeError = [SpeedUpMediaNative.JobApi]::LastError
+        try {
+            if (-not $Process.HasExited) {
+                $Process.Kill()
+                $Process.WaitForExit()
+            }
+        } catch {}
+        throw ("Could not attach FFmpeg to its automatic-cleanup Job Object (Win32 error {0}). FFmpeg was stopped to avoid leaving an orphan process." -f $nativeError)
+    }
+}
+
+function Close-ProcessCleanupJob {
+    if ($script:ProcessJobHandle -ne [IntPtr]::Zero) {
+        try { [SpeedUpMediaNative.JobApi]::Close($script:ProcessJobHandle) } catch {}
+        $script:ProcessJobHandle = [IntPtr]::Zero
+    }
+}
+
+function Register-ConsoleCancellation {
+    if ($script:CancelHandlerRegistered) { return }
+    try {
+        $script:CancelHandler = [System.ConsoleCancelEventHandler]{
+            param($sender, $eventArgs)
+            $eventArgs.Cancel = $true
+            $script:CancellationRequested = $true
+        }
+        [Console]::add_CancelKeyPress($script:CancelHandler)
+        $script:CancelHandlerRegistered = $true
+    } catch {
+        Write-Message -Level WARN -Message ("Could not register the Ctrl+C handler; Q/Esc cancellation and process cleanup remain available. {0}" -f $_.Exception.Message)
+    }
+}
+
+function Unregister-ConsoleCancellation {
+    if ($script:CancelHandlerRegistered -and $script:CancelHandler) {
+        try { [Console]::remove_CancelKeyPress($script:CancelHandler) } catch {}
+    }
+    $script:CancelHandler = $null
+    $script:CancelHandlerRegistered = $false
+}
+
+function Test-CancellationRequest {
+    if ($script:CancellationRequested) { return $true }
+
+    try {
+        if (-not [Console]::IsInputRedirected -and [Console]::KeyAvailable) {
+            $keyInfo = [Console]::ReadKey($true)
+            if ($keyInfo.Key -eq [ConsoleKey]::Q -or $keyInfo.Key -eq [ConsoleKey]::Escape) {
+                $script:CancellationRequested = $true
+                return $true
+            }
+        }
+    } catch {
+        # Console key polling is unavailable in some hosts; Ctrl+C and the Job Object remain active.
+    }
+
+    return $false
+}
+
 function Show-Progress {
     param(
         [int]$FileIndex,
@@ -581,14 +775,24 @@ function Invoke-FFmpegWithProgress {
     $fileWatch = [System.Diagnostics.Stopwatch]::StartNew()
     $expectedOutputDuration = if ($SourceDuration -gt 0) { $SourceDuration / $Speed } else { 0.0 }
     $lastDraw = [DateTime]::MinValue
+    $wasCancelled = $false
 
     try {
         if (-not $process.Start()) { throw 'Could not start FFmpeg.' }
+        $script:ActiveFfmpegProcess = $process
+        Add-ProcessToCleanupJob -Process $process
         $errorTask = $process.StandardError.ReadToEndAsync()
         $source = $process.StandardOutput
         $readTask = $source.ReadLineAsync()
 
         while ($true) {
+            if (Test-CancellationRequest) {
+                $wasCancelled = $true
+                Write-Message -Level WARN -Message ("Cancellation requested. Stopping FFmpeg for '{0}'..." -f $DisplayName)
+                try { if (-not $process.HasExited) { $process.Kill() } } catch {}
+                break
+            }
+
             if ($readTask.IsCompleted) {
                 $line = $readTask.GetAwaiter().GetResult()
                 if ($null -eq $line) { break }
@@ -618,6 +822,9 @@ function Invoke-FFmpegWithProgress {
                 $lastDraw = $now
             }
         }
+        if ($wasCancelled -and -not $process.HasExited) {
+            try { $process.Kill() } catch {}
+        }
         $process.WaitForExit()
         $fileWatch.Stop()
         $errorText = if ($errorTask) { $errorTask.GetAwaiter().GetResult() } else { '' }
@@ -630,9 +837,21 @@ function Invoke-FFmpegWithProgress {
             }
         }
         $finalSpeed = if ($progressValues.ContainsKey('speed') -and $progressValues['speed']) { [string]$progressValues['speed'] } else { '--' }
-        return @{ ExitCode = $process.ExitCode; ErrorText = $errorText; Duration = $fileWatch.Elapsed.TotalSeconds; Speed = $finalSpeed }
+        return @{ Cancelled = $wasCancelled; ExitCode = $process.ExitCode; ErrorText = $errorText; Duration = $fileWatch.Elapsed.TotalSeconds; Speed = $finalSpeed }
     } finally {
-        if ($process) { $process.Dispose() }
+        if ($process) {
+            try {
+                if (-not $process.HasExited) {
+                    try { $process.Kill() } catch {}
+                    try { [void]$process.WaitForExit(5000) } catch {}
+                    if ($script:LogPath) {
+                        try { Add-Content -LiteralPath $script:LogPath -Value ("[{0}] [WARN] Forced FFmpeg shutdown during script cleanup." -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')) -Encoding UTF8 } catch {}
+                    }
+                }
+            } catch {}
+            if ([object]::ReferenceEquals($script:ActiveFfmpegProcess, $process)) { $script:ActiveFfmpegProcess = $null }
+            $process.Dispose()
+        }
     }
 }
 
@@ -705,7 +924,7 @@ try {
     if (-not (Test-Path -LiteralPath $script:OutputDirectory -PathType Container)) { New-Item -ItemType Directory -Path $script:OutputDirectory -Force | Out-Null }
     if (-not (Test-Path -LiteralPath $script:LogsDirectory -PathType Container)) { New-Item -ItemType Directory -Path $script:LogsDirectory -Force | Out-Null }
     $script:LogPath = Join-Path $script:LogsDirectory ('Speed-Up-Media_{0}.log' -f (Get-Date -Format 'yyyy-MM-dd_HH-mm-ss-fff'))
-    Set-Content -LiteralPath $script:LogPath -Value 'Speed-Up-Media run log' -Encoding UTF8
+    Set-Content -LiteralPath $script:LogPath -Value 'Speed-Up Media PS run log' -Encoding UTF8
 } catch {
     Write-ThemeHost "Could not create the output/Logs folders: $($_.Exception.Message)"
     Read-Host 'Press Enter to exit' | Out-Null
@@ -762,15 +981,34 @@ Write-Host ''
 Write-Message -Level TITLE -Message ("Starting: speed {0} | files: {1} | quality: {2}" -f $speedLabel, $filesToProcess.Count, (Get-QualityDisplayName))
 Write-Message -Level INFO -Message ("Settings: recursive={0}; speed suffix={1}; skip existing={2}; external subtitles={3}; embedded subtitles={4}; chapters={5}; artwork={6}" -f $script:Settings.Recursive, $script:Settings.AddSpeedSuffix, $script:Settings.SkipExisting, $script:Settings.ExternalSubtitles, $script:Settings.EmbeddedSubtitles, $script:Settings.ScaleChapters, $script:Settings.PreserveArtwork)
 Write-ThemeHost '  Progress uses the native PowerShell display. FFmpeg warnings and errors are saved under Logs.'
+Write-ThemeHost '  Cancel the current conversion with Q, Esc, or Ctrl+C. Closing this window also stops FFmpeg.'
 Write-Host ''
 
 $overallWatch = [System.Diagnostics.Stopwatch]::StartNew()
 $successCount = 0
 $failedCount = 0
 $skippedCount = 0
+$cancelledCount = 0
 $sidecarErrorCount = 0
+$queueCancelled = $false
+
+try {
+    Initialize-ProcessJob
+    Register-ConsoleCancellation
+} catch {
+    Write-Message -Level ERROR -Message ("Safe FFmpeg process management could not be enabled: {0}" -f $_.Exception.Message)
+    Write-Message -Level ERROR -Message 'No conversions were started.'
+    Close-ProcessCleanupJob
+    Read-Host 'Press Enter to exit' | Out-Null
+    exit 1
+}
 
 for ($fileIndex = 0; $fileIndex -lt $filesToProcess.Count; $fileIndex++) {
+    if ($script:CancellationRequested) {
+        $queueCancelled = $true
+        Write-Message -Level WARN -Message 'Cancellation requested. No additional files will be started.'
+        break
+    }
     $file = $filesToProcess[$fileIndex]
     $humanIndex = $fileIndex + 1
     $displayName = Get-RelativeDisplayPath -File $file
@@ -898,7 +1136,11 @@ for ($fileIndex = 0; $fileIndex -lt $filesToProcess.Count; $fileIndex++) {
 
         $runResult = Invoke-FFmpegWithProgress -FfmpegPath $script:FFmpegPath -Arguments $ffArgs -SourceDuration $sourceDuration -Speed $speed -FileIndex $humanIndex -FileCount $filesToProcess.Count -DisplayName $displayName -OverallWatch $overallWatch
         Close-ProgressDisplay
-        if ($runResult.ExitCode -eq 0 -and (Test-Path -LiteralPath $temporaryOutputPath -PathType Leaf)) {
+        if ($runResult.Cancelled) {
+            $cancelledCount++
+            $queueCancelled = $true
+            Write-Message -Level WARN -Message 'Current conversion cancelled. Remaining files will not be started.'
+        } elseif ($runResult.ExitCode -eq 0 -and (Test-Path -LiteralPath $temporaryOutputPath -PathType Leaf)) {
             Move-Item -LiteralPath $temporaryOutputPath -Destination $outputPath -Force -ErrorAction Stop
             Write-Message -Level SUCCESS -Message ("Completed in {0} (FFmpeg speed: {1})." -f (Format-Duration $runResult.Duration), $runResult.Speed)
             $successCount++
@@ -928,8 +1170,11 @@ for ($fileIndex = 0; $fileIndex -lt $filesToProcess.Count; $fileIndex++) {
         if (Test-Path -LiteralPath $temporaryOutputPath -PathType Leaf) { Remove-Item -LiteralPath $temporaryOutputPath -Force -ErrorAction SilentlyContinue }
         if ($chapterMetadataPath -and (Test-Path -LiteralPath $chapterMetadataPath -PathType Leaf)) { Remove-Item -LiteralPath $chapterMetadataPath -Force -ErrorAction SilentlyContinue }
     }
+    if ($queueCancelled) { break }
 }
 
+Unregister-ConsoleCancellation
+Close-ProcessCleanupJob
 $overallWatch.Stop()
 Close-ProgressDisplay -All
 Write-Host ''
@@ -937,6 +1182,11 @@ Write-ThemeHost '  ═══════════════════ SUM
 Write-Message -Level SUCCESS -Message ("Succeeded: {0}" -f $successCount)
 Write-Message -Level WARN -Message ("Skipped: {0}" -f $skippedCount)
 Write-Message -Level ERROR -Message ("Failed: {0}" -f $failedCount)
+Write-Message -Level WARN -Message ("Cancelled: {0}" -f $cancelledCount)
+if ($queueCancelled) {
+    $notStartedCount = [Math]::Max(0, $filesToProcess.Count - $successCount - $failedCount - $skippedCount - $cancelledCount)
+    if ($notStartedCount -gt 0) { Write-Message -Level WARN -Message ("Not started: {0}" -f $notStartedCount) }
+}
 if ($sidecarErrorCount -gt 0) { Write-Message -Level WARN -Message ("External subtitle errors: {0}" -f $sidecarErrorCount) }
 Write-Message -Level INFO -Message ("Total elapsed: {0}" -f (Format-Duration $overallWatch.Elapsed.TotalSeconds))
 Write-Message -Level INFO -Message ("Output folder: {0}" -f $script:OutputDirectory)
